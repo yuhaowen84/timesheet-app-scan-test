@@ -1,5 +1,5 @@
 streamlit
-torch          
+torch
 torchvision
 torchaudio
 transformers
