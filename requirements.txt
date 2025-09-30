@@ -1,6 +1,9 @@
 streamlit
-pandas
-Pillow
+torch          
+torchvision
+torchaudio
+transformers
+pillow
+opencv-python-headless
 numpy
-easyocr
-pytesseract
+pandas
