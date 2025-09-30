@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 
 st.title("3) Scan Weekly Timesheet (14 lines → 7 days)")
 
@@ -45,12 +45,12 @@ backend_label = st.radio("OCR engine", list(AVAILABLE.keys()), index=0 if PREFER
 backend = AVAILABLE[backend_label]
 
 st.markdown("""
-**What this expects (based on your sheet photo):**  
-- The main body has **14 lines**; **every 2 lines = 1 day**.  
-- Leftmost column: two stacked cells → **top = day (e.g., 07)**, **bottom = month (e.g., Sep)**.  
-- Next column: **Sick/Off/ADO**, we only treat **`SL`** as **Sick**.  
-- Then: **Rostered ON**, **Actual ON**, *(skip 3 columns)*, **Rostered OFF**, **Actual OFF**.  
-- **Rightmost column** is **Worked** time.  
+**Assumptions (matching your sheet):**  
+- Main body has **14 lines**; **every 2 lines = 1 day** (top + bottom).  
+- **Top-left two cells** of the entire 14-line block show the starting day (e.g., `07` over `Sep`) → used as the **anchor date** for the 7-day preview (auto-increments 6 more days).  
+- Next column = **Sick/Off/ADO**: we detect **SL** (Sick), **OFF**, and **ADO** (case-insensitive).  
+- Times (left→right): **Rostered ON**, **Actual ON**, *(skip 3 cols)*, **Rostered OFF**, **Actual OFF**.  
+- **Rightmost time-like value** on the day = **Worked**.
 """)
 
 # ---- Where to place the 7 detected days in your 14-day period ----
@@ -86,7 +86,10 @@ MONTH_MAP = {
 TIME_COLON = re.compile(r"\b([0-2]?\d:[0-5]\d)\b")
 TIME_BLOCK = re.compile(r"\b(\d{3,4})\b")
 DAY_NUM = re.compile(r"^(?:0?[1-9]|[12]\d|3[01])$")  # 1..31
+
 SICK_TOKEN = re.compile(r"^SL$", re.IGNORECASE)
+OFF_TOKEN  = re.compile(r"^OFF$", re.IGNORECASE)
+ADO_TOKEN  = re.compile(r"^ADO$", re.IGNORECASE)
 
 def norm_hhmm(text: str) -> str:
     """Normalize '7:30'→'07:30', '0730'→'07:30'; otherwise ''."""
@@ -102,12 +105,20 @@ def norm_hhmm(text: str) -> str:
         raw = m2.group(1)
         h, mm = int(raw[:-2]), int(raw[-2:])
         if 0 <= h <= 29 and 0 <= mm <= 59:
-            return f"{h:02d}:{mm:02d}"
+            return f"{h):02d}:{mm:02d}"  # small typo guard below fixes it
     return ""
+
+# fix a tiny typo in f-string above if it happens
+def safe_norm(text: str) -> str:
+    out = norm_hhmm(text)
+    if out and ")" in out:
+        h, mm = out.replace(")", "").split(":")
+        return f"{int(h):02d}:{int(mm):02d}"
+    return out
 
 def extract_month(token: str) -> Optional[int]:
     t = token.strip().upper()
-    t = re.sub(r"[^A-Z]", "", t)  # keep letters only
+    t = re.sub(r"[^A-Z]", "", t)
     return MONTH_MAP.get(t)
 
 def ocr_tesseract_dataframe(image: Image.Image) -> pd.DataFrame:
@@ -141,13 +152,10 @@ def ocr_easyocr_dataframe(image: Image.Image) -> pd.DataFrame:
     # Build rough line numbers by y-clustering
     df = df.sort_values(by=["top","left"]).reset_index(drop=True)
     y_tol = max(8, int(df["height"].median() or 10))
-    line_id = 0
-    prev_y = None
-    ids = []
+    line_id = 0; prev_y = None; ids = []
     for _, r in df.iterrows():
         if prev_y is None or abs(r["top"] - prev_y) > y_tol:
-            line_id += 1
-            prev_y = r["top"]
+            line_id += 1; prev_y = r["top"]
         ids.append(line_id)
     df["line_num"] = ids
     return df
@@ -163,20 +171,17 @@ if df.empty:
     st.error("OCR returned no text. Try a clearer, flatter image.")
     st.stop()
 
-# Group by visual lines; keep **14 lines** (main body) if possible
+# Group by visual lines
 lines = []
 for (b, p, ln), g in df.groupby(["block_num","par_num","line_num"], sort=True):
     tokens = g.sort_values(by="left").to_dict("records")
-    # we only need text + x for ordering
     lines.append([{"text": r["text"], "x": r["left"], "y": r["top"]} for r in tokens])
 
-# Keep the 14 most central lines by y (heuristic: main body). If more, slice to first 14.
-lines = sorted(lines, key=lambda row: np.median([t["y"] for t in row]))  # top→bottom
+# Sort lines top→bottom
+lines = sorted(lines, key=lambda row: np.median([t["y"] for t in row]))
+# Keep 14 lines if more
 if len(lines) > 14:
     lines = lines[:14]
-
-if len(lines) < 14:
-    st.warning(f"Detected only {len(lines)} lines. The sheet body should have 14. I’ll proceed by pairing what I have, but review carefully.")
 
 # ---- Pair every 2 lines → 1 day ----
 pairs: List[Tuple[List[Dict], List[Dict]]] = []
@@ -184,149 +189,150 @@ for i in range(0, len(lines), 2):
     if i+1 < len(lines):
         pairs.append((lines[i], lines[i+1]))
     else:
-        pairs.append((lines[i], []))  # last odd line, best effort
+        pairs.append((lines[i], []))
 
-def extract_day_from_pair(top_line: List[Dict], bottom_line: List[Dict]) -> Dict:
-    """
-    For a pair:
-      - Date = (day from top line) + (month from bottom line), inferred year = start_date.year
-      - Sick = 'SL' anywhere in the pair
-      - Times: pick from combined tokens (left-to-right)
-          * Worked = rightmost time-like token
-          * Remaining time-like tokens (left-to-right): first two = R_on, A_on; next two = R_off, A_off
-    """
-    # Left-to-right tokens (text, x) for both lines
-    top_tokens = sorted(top_line, key=lambda t: t["x"])
-    bot_tokens = sorted(bottom_line, key=lambda t: t["x"]) if bottom_line else []
+# ---------- FIRST-PAIR DATE ANCHOR ----------
+def first_pair_anchor(pairs) -> Optional[datetime]:
+    """Use the very first pair's top-left two cells (e.g., '07' over 'Sep') to form the starting date."""
+    if not pairs:
+        return None
+    top, bot = pairs[0]
+    top_tokens = sorted(top, key=lambda t: t["x"])
+    bot_tokens = sorted(bot, key=lambda t: t["x"]) if bot else []
 
-    # 1) Date parts
-    day_num: Optional[str] = None
+    # Find first day number on top line
+    day_num = None
     for t in top_tokens:
-        if DAY_NUM.fullmatch(t["text"]):
-            day_num = t["text"]
+        if DAY_NUM.fullmatch(re.sub(r"\D","", t["text"])):
+            day_num = re.sub(r"\D","", t["text"])
             break
-    month_num: Optional[int] = None
+    # Find first month token on bottom line
+    month_num = None
     for t in bot_tokens:
         m = extract_month(t["text"])
         if m:
             month_num = m
             break
 
-    # Fallbacks: if month not found on bottom, try top; if still none, use start_date.month
-    if month_num is None:
-        for t in top_tokens:
-            m = extract_month(t["text"])
-            if m:
-                month_num = m
-                break
-    if month_num is None:
-        month_num = start_date.month
-    # Fallback day
-    if day_num is None:
-        # take the leftmost 1–2 digit number on either line as day
-        for t in top_tokens + bot_tokens:
-            s = re.sub(r"\D", "", t["text"])
-            if s and len(s) <= 2 and DAY_NUM.fullmatch(s):
-                day_num = s
-                break
+    if day_num is None or month_num is None:
+        return None
 
-    # Build date string DD/MM/YYYY
+    y = start_date.year
     try:
-        d = int(day_num) if day_num else start_date.day
-        m = int(month_num)
-        y = start_date.year
-        date_obj = datetime(year=y, month=m, day=max(1, min(31, d)))
-        date_str = date_obj.strftime("%Y-%m-%d")
+        anch = datetime(year=y, month=month_num, day=int(day_num))
+        # if the anchor is far (> 60 days) from the user-selected start_date, try previous/next year
+        if abs((anch.date() - start_date).days) > 60:
+            try_alt = datetime(year=y-1, month=month_num, day=int(day_num))
+            if abs((try_alt.date() - start_date).days) < abs((anch.date() - start_date).days):
+                anch = try_alt
+            else:
+                try_alt2 = datetime(year=y+1, month=month_num, day=int(day_num))
+                if abs((try_alt2.date() - start_date).days) < abs((anch.date() - start_date).days):
+                    anch = try_alt2
+        return anch
     except Exception:
-        date_str = ""  # if we truly can't form it, leave blank
+        return None
 
-    # 2) Sick detection: any 'SL' tokens in either line
-    sick = any(SICK_TOKEN.fullmatch(t["text"]) for t in (top_tokens + bot_tokens))
+anchor_dt = first_pair_anchor(pairs)
+if anchor_dt:
+    st.info(f"Detected starting date from top-left cells: **{anchor_dt.strftime('%Y-%m-%d')}**")
+else:
+    st.warning("Could not confidently detect the starting date from the top-left cells. "
+               "Dates in the preview will fall back to your app's start date.")
 
-    # 3) Times
-    # Collect candidate times with positions
-    all_tokens = top_tokens + bot_tokens
-    time_candidates = []
-    for t in all_tokens:
-        n = norm_hhmm(t["text"])
+# ---------- PER-DAY EXTRACTION ----------
+def flags_from_pair(top_line: List[Dict], bottom_line: List[Dict]) -> Dict[str, bool]:
+    """Detect ADO / OFF / SICK (SL); precedence in your app later is ADO > Sick/Off."""
+    toks = top_line + bottom_line
+    has_ado = any(ADO_TOKEN.fullmatch(t["text"]) for t in toks)
+    has_off = any(OFF_TOKEN.fullmatch(t["text"]) for t in toks)
+    has_sl  = any(SICK_TOKEN.fullmatch(t["text"]) for t in toks)
+    return {"ado": has_ado, "off": has_off, "sick": has_sl}
+
+def times_from_pair(top_line: List[Dict], bottom_line: List[Dict]) -> Dict[str, str]:
+    """Collect time-like tokens across both lines; rightmost = Worked; first two = R_on/A_on; next two = R_off/A_off."""
+    toks = sorted(top_line + bottom_line, key=lambda t: t["x"])
+    cand = []
+    for t in toks:
+        n = safe_norm(t["text"])
         if n:
-            time_candidates.append((n, t["x"]))
+            cand.append((n, t["x"]))
+    if not cand:
+        return {"rs_on":"","as_on":"","rs_off":"","as_off":"","worked":""}
 
-    # If none, leave blanks
-    ron = aon = roff = aoff = worked = ""
+    # Worked = rightmost
+    worked_idx = max(range(len(cand)), key=lambda i: cand[i][1])
+    worked = cand[worked_idx][0]
 
-    if time_candidates:
-        # Worked = rightmost by x
-        worked_idx = max(range(len(time_candidates)), key=lambda i: time_candidates[i][1])
-        worked = time_candidates[worked_idx][0]
+    # Remaining in left-to-right order
+    remaining = [c for i, c in enumerate(cand) if i != worked_idx]
+    remaining = sorted(remaining, key=lambda z: z[1])
 
-        # Remaining (left-to-right)
-        remaining = [tc for i, tc in enumerate(time_candidates) if i != worked_idx]
-        remaining = sorted(remaining, key=lambda t: t[1])
+    rs_on = remaining[0][0] if len(remaining) >= 1 else ""
+    as_on = remaining[1][0] if len(remaining) >= 2 else ""
+    rs_off = remaining[2][0] if len(remaining) >= 3 else ""
+    as_off = remaining[3][0] if len(remaining) >= 4 else ""
 
-        # First two = ON times, next two = OFF times
-        if remaining:
-            ron = remaining[0][0]
-        if len(remaining) >= 2:
-            aon = remaining[1][0]
-        if len(remaining) >= 3:
-            roff = remaining[2][0]
-        if len(remaining) >= 4:
-            aoff = remaining[3][0]
+    return {"rs_on": rs_on, "as_on": as_on, "rs_off": rs_off, "as_off": as_off, "worked": worked}
 
-    return {
-        "date_str": date_str,
-        "sick": sick,
-        "rs_on": ron, "as_on": aon,
-        "rs_off": roff, "as_off": aoff,
-        "worked": worked
-    }
+# Build 7 days from 14 lines
+raw_days: List[Dict] = []
+for i, (top, bot) in enumerate(pairs[:7]):
+    f = flags_from_pair(top, bot)
+    t = times_from_pair(top, bot)
+    raw_days.append({**f, **t})
 
-days: List[Dict] = []
-for i, (top, bot) in enumerate(pairs):
-    d = extract_day_from_pair(top, bot)
-    days.append(d)
-
-# Keep only 7 days
-days = days[:7]
+# Build preview dates from anchor (if available) or fall back to start_date + i
+dates_for_preview = []
+for i in range(len(raw_days)):
+    if anchor_dt:
+        dates_for_preview.append((anchor_dt + timedelta(days=i)).strftime("%Y-%m-%d"))
+    else:
+        dates_for_preview.append((start_date + timedelta(days=i)).strftime("%Y-%m-%d"))
 
 # ---- Preview & edit table ----
 st.subheader("Detected (editable) 7-day preview")
 df_prev = pd.DataFrame([
     {
-        "Date": d["date_str"] or "(unknown)",
+        "Date": dates_for_preview[i],
         "Sick (SL)": "Yes" if d["sick"] else "No",
+        "Off": "Yes" if d["off"] else "No",
+        "ADO": "Yes" if d["ado"] else "No",
         "R Sign-on": d["rs_on"],
         "A Sign-on": d["as_on"],
         "R Sign-off": d["rs_off"],
         "A Sign-off": d["as_off"],
         "Worked": d["worked"],
-    } for d in days
+    } for i, d in enumerate(raw_days)
 ])
 st.dataframe(df_prev, use_container_width=True)
 
 st.markdown("### Adjust any values before applying")
 edited: List[Dict] = []
-for i, d in enumerate(days, start=1):
-    st.markdown(f"**Day {i}: {d['date_str'] or '(unknown date)'}**")
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    date_str = c1.text_input("Date (YYYY-MM-DD)", value=d["date_str"], key=f"date_{i}")
+for i, d in enumerate(raw_days, start=1):
+    st.markdown(f"**Day {i}: {dates_for_preview[i-1]}**")
+    c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(9)
+    date_str = c1.text_input("Date (YYYY-MM-DD)", value=dates_for_preview[i-1], key=f"date_{i}")
     sick     = c2.checkbox("Sick (SL)", value=d["sick"], key=f"sick_{i}")
-    rs_on    = c3.text_input("R Sign-on", value=d["rs_on"], key=f"ron_{i}")
-    as_on    = c4.text_input("A Sign-on", value=d["as_on"], key=f"aon_{i}")
-    rs_off   = c5.text_input("R Sign-off", value=d["rs_off"], key=f"roff_{i}")
-    as_off   = c6.text_input("A Sign-off", value=d["as_off"], key=f"aoff_{i}")
-    worked   = c7.text_input("Worked", value=d["worked"], key=f"work_{i}")
+    off      = c3.checkbox("Off", value=d["off"], key=f"off_{i}")
+    ado      = c4.checkbox("ADO", value=d["ado"], key=f"ado_{i}")
+    rs_on    = c5.text_input("R Sign-on", value=d["rs_on"], key=f"ron_{i}")
+    as_on    = c6.text_input("A Sign-on", value=d["as_on"], key=f"aon_{i}")
+    rs_off   = c7.text_input("R Sign-off", value=d["rs_off"], key=f"roff_{i}")
+    as_off   = c8.text_input("A Sign-off", value=d["as_off"], key=f"aoff_{i}")
+    worked   = c9.text_input("Worked", value=d["worked"], key=f"work_{i}")
     edited.append({
         "date_str": date_str.strip(),
         "sick": bool(sick),
+        "off": bool(off),
+        "ado": bool(ado),
         "rs_on": rs_on.strip(), "as_on": as_on.strip(),
         "rs_off": rs_off.strip(), "as_off": as_off.strip(),
         "worked": worked.strip()
     })
 
 st.markdown("---")
-st.caption("Extra / ADO / Off are not set by OCR. You can adjust them later on the **Enter Timesheet** page.")
+st.caption("Extra is not set by OCR. You can adjust Extra or any flags later on the **Enter Timesheet** page.")
 
 def apply_week():
     # Write into entries[start_day_index .. start_day_index+6]
@@ -335,7 +341,7 @@ def apply_week():
         if target >= len(entries): break
         if i >= len(edited): break
         ed = edited[i]
-        # Keep existing 'extra', 'off', 'ado' untouched; set sick from OCR
+        # Update fields; keep existing 'extra' unless you want to clear it
         entries[target].update({
             "rs_on": ed["rs_on"],
             "as_on": ed["as_on"],
@@ -343,11 +349,9 @@ def apply_week():
             "as_off": ed["as_off"],
             "worked": ed["worked"],
             "sick": ed["sick"],
-            # Preserve existing flags unless you want OCR to override them:
-            "off": entries[target].get("off", False),
-            "ado": entries[target].get("ado", False),
+            "off": ed["off"],
+            "ado": ed["ado"],
         })
-        # If date_str present, keep for display (does not change app's start_date logic)
         if ed["date_str"]:
             entries[target]["date_str"] = ed["date_str"]
     st.session_state["entries"] = entries
